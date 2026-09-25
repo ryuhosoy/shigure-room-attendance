@@ -250,3 +250,37 @@ class EventRepository:
         cur.execute(sql)
         ctx.commit()
         ctx.close()
+
+    @staticmethod
+    def insert_room_visit(user_id: str, visit_date, entered_at) -> bool:
+        """同じユーザー・同じ日付の入室は1件だけ追加する.
+
+        :return: 新規追加できた場合は True. 同日の再確定は False.
+        """
+        ctx = mysql.connector.connect(**config)
+        try:
+            cur = ctx.cursor()
+            sql = (
+                'INSERT IGNORE INTO room_visit '
+                '(user_id, visit_date, entered_at) VALUES (%s, %s, %s)'
+            )
+            cur.execute(sql, (user_id, visit_date, entered_at))
+            ctx.commit()
+            return cur.rowcount == 1
+        finally:
+            ctx.close()
+
+    @staticmethod
+    def select_room_visits():
+        """入室記録を日付の新しい順に返す."""
+        ctx = mysql.connector.connect(**config)
+        try:
+            cur = ctx.cursor(dictionary=True)
+            sql = (
+                'SELECT user_id, visit_date, entered_at FROM room_visit '
+                'ORDER BY visit_date DESC, entered_at DESC, id DESC'
+            )
+            cur.execute(sql)
+            return cur.fetchall()
+        finally:
+            ctx.close()

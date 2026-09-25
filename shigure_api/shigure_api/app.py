@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import queue
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -12,6 +13,7 @@ from typing import AsyncIterator, List, Optional, Set
 from fastapi import FastAPI, Header, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
+from fastapi.staticfiles import StaticFiles
 from shigure_api.config import (
     API_KEY,
     FACE_MODELS_DIR,
@@ -20,11 +22,20 @@ from shigure_api.config import (
     PCA_TRAJECTORY_MAX_POINTS,
     default_pca_model_path,
 )
-from shigure_api.events import ContactCandidate, UserEvent, UserSummary, contact_row_to_model, user_event_to_dict
-
+from shigure_api.attendance import build_attendance, record_confirmed_visit
+from shigure_api.events import (
+    ContactCandidate,
+    UserEvent,
+    UserSummary,
+    contact_row_to_model,
+    user_event_to_dict,
+)
 from shigure_api.feature_images import find_face_image_path, load_face_thumbnail
 from shigure_api.pca_plot import PcaPlotHub, PcaPlotStateBuilder, state_to_dict
 from shigure_api.tracking_debug import TrackingDebugHub
+
+logger = logging.getLogger(__name__)
+ATTENDANCE_WEB_DIR = Path(__file__).resolve().parents[2] / 'attendance_web'
 
 
 class EventHub:
@@ -56,7 +67,26 @@ class EventHub:
         self._history.append(event)
         if len(self._history) > self._history_limit:
             self._history = self._history[-self._history_limit:]
-        return [user_event_to_dict(event)]
+        payloads = [user_event_to_dict(event)]
+        if event.type == 'user_confirmed':
+            payloads.append(await self._record_attendance(event))
+        return payloads
+
+    async def _record_attendance(self, event: UserEvent) -> dict:
+        """ユーザー確定を日本時間で1日1回まで入室記録にする."""
+        try:
+            result = await asyncio.to_thread(
+                record_confirmed_visit, event.user_id, event.timestamp,
+            )
+        except Exception as exc:
+            logger.exception('入室記録に失敗しました: %s', exc)
+            result = {
+                'recorded': False,
+                'user_id': event.user_id,
+                'reason': str(exc),
+            }
+        result['type'] = 'attendance_recorded'
+        return result
 
     async def broadcast(self, payloads: List[dict]) -> None:
         async with self._lock:
@@ -216,6 +246,15 @@ def create_app() -> FastAPI:
         pca_hub.enqueue(state_to_dict(pca_builder.build_state()))
         return {'show_full_dictionary': pca_builder.show_full_dictionary}
 
+    @app.get('/api/attendance')
+    def attendance(
+        x_api_key: str | None = Header(default=None, alias='X-API-Key'),
+    ) -> dict:
+        """研究室メンバーの入室回数（日本時間・1日最大1回）を返す."""
+        _verify_api_key(x_api_key)
+        user_ids = [user.user_id for user in _scan_users(FACE_MODELS_DIR)]
+        return build_attendance(user_ids)
+
     @app.get('/users', response_model=List[UserSummary])
     def list_users(x_api_key: str | None = Header(default=None, alias='X-API-Key')) -> List[UserSummary]:
         _verify_api_key(x_api_key)
@@ -322,6 +361,13 @@ def create_app() -> FastAPI:
             pass
         finally:
             await tracking_debug_hub.disconnect(websocket)
+
+    if ATTENDANCE_WEB_DIR.is_dir():
+        app.mount(
+            '/attendance',
+            StaticFiles(directory=ATTENDANCE_WEB_DIR, html=True),
+            name='attendance',
+        )
 
     return app
 
