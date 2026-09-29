@@ -46,15 +46,25 @@ class TrackingDebugHub:
 
     def __init__(self) -> None:
         self._clients: Set[Any] = set()
+        self._stats_clients: Set[Any] = set()
         self._lock = asyncio.Lock()
+        self._stats_clients_lock = asyncio.Lock()
         self._thread_queue: queue.Queue[Dict[str, Any]] = queue.Queue()
         self._latest_payload: Optional[Dict[str, Any]] = None
 
     async def start(self) -> None:
         asyncio.create_task(self._broadcast_loop())
+        asyncio.create_task(self._stats_loop())
 
     def enqueue(self, payload: Dict[str, Any]) -> None:
         self._thread_queue.put_nowait(payload)
+
+    def stats(self) -> Dict[str, Any]:
+        """画像送出待ちの枚数を返す。画像送出キューは経由しない."""
+        return {
+            'type': 'tracking_debug_stats',
+            'queue_depth': self._thread_queue.qsize(),
+        }
 
     async def _broadcast_loop(self) -> None:
         while True:
@@ -71,6 +81,24 @@ class TrackingDebugHub:
                 for ws in dead:
                     self._clients.discard(ws)
 
+    async def _stats_loop(self) -> None:
+        """キュー統計を画像とは別の WebSocket へ送る。画像の滞留では遅れない."""
+        while True:
+            await asyncio.sleep(0.25)
+            payload = self.stats()
+            async with self._stats_clients_lock:
+                clients = list(self._stats_clients)
+            dead = []
+            for ws in clients:
+                try:
+                    await ws.send_json(payload)
+                except Exception:
+                    dead.append(ws)
+            if dead:
+                async with self._stats_clients_lock:
+                    for ws in dead:
+                        self._stats_clients.discard(ws)
+
     async def connect(self, websocket) -> None:
         await websocket.accept()
         async with self._lock:
@@ -81,3 +109,15 @@ class TrackingDebugHub:
     async def disconnect(self, websocket) -> None:
         async with self._lock:
             self._clients.discard(websocket)
+
+    async def connect_stats(self, websocket) -> None:
+        """キュー統計用の WebSocket を受け付ける。画像は送らない."""
+        await websocket.accept()
+        async with self._stats_clients_lock:
+            self._stats_clients.add(websocket)
+        await websocket.send_json(self.stats())
+
+    async def disconnect_stats(self, websocket) -> None:
+        """キュー統計用の WebSocket を外す."""
+        async with self._stats_clients_lock:
+            self._stats_clients.discard(websocket)
