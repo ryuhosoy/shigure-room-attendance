@@ -1,16 +1,21 @@
 import { useEffect, useMemo, useState } from 'react';
 import { formatWhen } from './format';
-import type { AttendanceResponse, AttendanceUser, UserId } from './types';
+import {
+  WINDOW_DAYS,
+  comparePresence,
+  dayLabel,
+  presenceRow,
+  recentDates,
+  recencyLabel,
+  tokyoToday,
+  type PresenceRow,
+} from './presence';
+import type { AttendanceResponse, UserId } from './types';
 
-function barWidth(visitCount: number, maxCount: number): number {
-  if (visitCount === 0) return 0;
-  return Math.max(6, Math.round((visitCount / maxCount) * 100));
-}
-
-function fillClass(user: AttendanceUser): string {
-  if (user.visit_count === 0) return 'fill zero';
-  if (user.visited_today) return 'fill today';
-  return 'fill';
+function cellClass(row: PresenceRow, day: string, today: string): string {
+  if (!row.dates.has(day)) return 'cell';
+  if (day === today) return 'cell today';
+  return 'cell on';
 }
 
 export function App() {
@@ -49,19 +54,24 @@ export function App() {
   }, []);
 
   const users = data?.users ?? [];
-  const maxCount = Math.max(1, ...users.map((user) => user.visit_count));
-  const todayCount = users.filter((user) => user.visited_today).length;
+  const today = data?.today && /^\d{4}-\d{2}-\d{2}$/.test(data.today) ? data.today : tokyoToday();
+  const days = useMemo(() => recentDates(today, WINDOW_DAYS), [today]);
+  const rows = useMemo(
+    () => users.map((user) => presenceRow(user, today)).sort(comparePresence),
+    [users, today],
+  );
+  const todayCount = rows.filter((row) => row.daysSince === 0).length;
   const active = useMemo(() => {
-    if (users.length === 0) return null;
-    return users.find((user) => user.user_id === selected) ?? users[0];
-  }, [users, selected]);
+    if (rows.length === 0) return null;
+    return rows.find((row) => row.user.user_id === selected) ?? rows[0];
+  }, [rows, selected]);
 
   return (
     <main>
       <header>
         <h1>研究室 入室管理</h1>
         <p>
-          日本時間で、その日にユーザー確定が1回でもあれば入室1回として数えます。同じ日の2回目以降は追加しません。
+          直近14日の入室です。日本時間で、その日にユーザー確定が1回でもあればその日を入室として数えます。最後に来た日が古い人を上に並べています。
         </p>
       </header>
       {error ? <div className="banner">{error}</div> : null}
@@ -75,51 +85,70 @@ export function App() {
         </div>
         <div>
           <strong>{todayCount}</strong>
-          <span>本日の入室（{data?.today || '—'}）</span>
+          <span>本日の入室（{data?.today || today}）</span>
         </div>
       </section>
-      <section className="chart">
+      <section className="chart" aria-label="直近14日の入室">
         <div className="legend">
           <span>
             <i className="swatch usual" />
-            これまでの入室
+            来室
           </span>
           <span>
             <i className="swatch today" />
-            本日入室済み
+            本日
           </span>
         </div>
-        {users.map((user) => (
+        {rows.length > 0 ? (
+          <div className="scale-row">
+            <span />
+            <span className="cells scale">
+              {days.map((day, index) => {
+                const label = dayLabel(day, days[index - 1] ?? null);
+                const edge = index === 0 || index === days.length - 1 || day.endsWith('-01');
+                return (
+                  <span key={day} className={edge ? 'edge' : undefined}>
+                    {label}
+                  </span>
+                );
+              })}
+            </span>
+            <span />
+          </div>
+        ) : null}
+        {rows.map((row) => (
           <button
-            key={user.user_id}
-            className={active?.user_id === user.user_id ? 'row selected' : 'row'}
-            onClick={() => setSelected(user.user_id)}
+            key={row.user.user_id}
+            className={active?.user.user_id === row.user.user_id ? 'row selected' : 'row'}
+            onClick={() => setSelected(row.user.user_id)}
             type="button"
           >
-            <span className="name">{user.display_name}</span>
-            <span className="track">
-              <span
-                className={fillClass(user)}
-                style={
-                  user.visit_count === 0
-                    ? undefined
-                    : { width: `${barWidth(user.visit_count, maxCount)}%` }
-                }
-              />
+            <span className="name">{row.user.display_name}</span>
+            <span className="cells">
+              {days.map((day) => (
+                <span
+                  key={day}
+                  className={cellClass(row, day, today)}
+                  title={`${day} ${row.dates.has(day) ? '入室' : 'なし'}`}
+                />
+              ))}
             </span>
-            <span className="count">{user.visit_count}回</span>
+            <span className="recency">
+              <strong>{recencyLabel(row.daysSince)}</strong>
+              <small>直近7日 {row.recentCount}日</small>
+            </span>
           </button>
         ))}
       </section>
       {active ? (
         <section className="detail">
-          <h2>{active.display_name} の入室</h2>
+          <h2>{active.user.display_name} の入室</h2>
           <p>
-            {active.last_entered_at
-              ? `最新: ${formatWhen(active.last_entered_at)}　合計 ${active.visit_count} 回`
+            {active.user.last_entered_at
+              ? `最新: ${formatWhen(active.user.last_entered_at)}　合計 ${active.user.visit_count} 回`
               : 'まだ入室記録はありません'}
           </p>
-          {active.visits.length > 0 ? (
+          {(active.user.visits ?? []).length > 0 ? (
             <table>
               <thead>
                 <tr>
@@ -128,7 +157,7 @@ export function App() {
                 </tr>
               </thead>
               <tbody>
-                {active.visits.map((visit) => (
+                {active.user.visits.map((visit) => (
                   <tr key={visit.visit_date}>
                     <td>{visit.visit_date}</td>
                     <td>{formatWhen(visit.entered_at)}</td>
